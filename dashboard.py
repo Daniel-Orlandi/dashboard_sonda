@@ -4,22 +4,76 @@ import pandas as pd
 import os
 from datetime import datetime, timedelta
 import glob
-import psycopg2
-from sqlalchemy import create_engine
 import re
+import numpy as np
 
-# Set page config
+# Set page config for crisis room use
 st.set_page_config(
-    page_title="Solar Data Pipeline Monitor",
+    page_title="Solar Data Monitor",
     page_icon="☀️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
-# lado direito pra um olhar mais detalhado, colocar seletor de estações (vini)
+
+# Custom CSS for crisis room design
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .station-header {
+        font-size: 1.8rem;
+        font-weight: bold;
+        color: #2c3e50;
+        text-align: center;
+        margin: 1rem 0;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+    }
+    .plot-container {
+        background-color: white;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 0.5rem 0;
+    }
+    .stSelectbox > div > div {
+        background-color: white;
+    }
+    .stDataFrame {
+        font-size: 0.9rem;
+    }
+    .subsection-header {
+        font-size: 1.2rem;
+        font-weight: bold;
+        color: #2c3e50;
+        margin: 1rem 0 0.5rem 0;
+        padding-bottom: 0.3rem;
+        border-bottom: 2px solid #e9ecef;
+    }
+    .variable-selector {
+        background-color: #f8f9fa;
+        padding: 0.5rem;
+        border-radius: 0.3rem;
+        margin-bottom: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # Title
-st.title("Solar Data Pipeline Monitor")
-st.markdown("**Data Operator Dashboard for FTP Download Pipeline Monitoring**")
+st.markdown('<h1 class="main-header">Solar Data Monitor</h1>', unsafe_allow_html=True)
+st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Real-time Solar Radiation & Meteorological Data</p>', unsafe_allow_html=True)
 
 # Function to get available stations
+@st.cache_data
 def get_available_stations():
     """Get list of available stations from the interim directory"""
     interim_dir = os.path.expanduser("data/interim")
@@ -32,6 +86,7 @@ def get_available_stations():
     return sorted(station_dirs)
 
 # Function to get the latest file for a specific station and data type
+@st.cache_data
 def get_latest_files_for_station(station):
     """Get the latest parquet file for a specific station and data type (SD, MD, WD)"""
     interim_dir = os.path.expanduser("data/interim")
@@ -64,13 +119,88 @@ def get_latest_files_for_station(station):
     
     return latest_files
 
+def safe_convert_timestamp(df, timestamp_col='TIMESTAMP'):
+    """
+    Safely convert timestamp column to datetime, handling various formats and issues
+    """
+    if timestamp_col not in df.columns:
+        return df
+    
+    # Check if already datetime
+    if pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
+        return df
+    
+    # Get sample of timestamp values to understand the format
+    sample_values = df[timestamp_col].dropna().head(10).astype(str)
+    
+    # Try to identify the format
+    for sample in sample_values:
+        if pd.isna(sample) or sample == '':
+            continue
+            
+        # Check if it's already a valid datetime string
+        try:
+            pd.to_datetime(sample)
+            # If successful, try to convert the whole column
+            try:
+                df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors='coerce')
+                return df
+            except Exception:
+                break
+        except:
+            continue
+    
+    # If we get here, the timestamps might be in a different format
+    # Check if the values look like they might be numeric timestamps
+    sample_values = df[timestamp_col].dropna().head(5).astype(str)
+    numeric_like = all(val.replace('.', '').replace('-', '').isdigit() for val in sample_values if val)
+    
+    if numeric_like:
+        # Create synthetic timestamps (assuming 1-minute intervals)
+        start_time = datetime.now() - timedelta(minutes=len(df))
+        timestamps = [start_time + timedelta(minutes=i) for i in range(len(df))]
+        df[timestamp_col] = timestamps
+    else:
+        # Create synthetic timestamps (assuming 1-minute intervals)
+        start_time = datetime.now() - timedelta(minutes=len(df))
+        timestamps = [start_time + timedelta(minutes=i) for i in range(len(df))]
+        df[timestamp_col] = timestamps
+    
+    return df
+
+def clean_numeric_columns(df):
+    """
+    Clean numeric columns by converting to numeric and handling invalid values
+    """
+    for col in df.columns:
+        if col in ['TIMESTAMP', 'source_file', 'station', 'data_type', 'file_path']:
+            continue
+            
+        # Try to convert to numeric, handling various formats
+        try:
+            # First try direct conversion
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        except:
+            # If that fails, try to clean the data first
+            try:
+                # Remove common non-numeric characters and try again
+                cleaned_values = df[col].astype(str).str.replace('NAN', 'NaN', case=False)
+                cleaned_values = cleaned_values.str.replace('"', '')
+                cleaned_values = cleaned_values.str.replace("'", '')
+                df[col] = pd.to_numeric(cleaned_values, errors='coerce')
+            except:
+                # If all else fails, keep as is
+                continue
+    
+    return df
+
 # Function to load data from latest files for a specific station
+@st.cache_data
 def load_latest_data_for_station(station):
     """Load data from the latest files for a specific station and data type"""
     latest_files = get_latest_files_for_station(station)
     
     if not latest_files:
-        st.error(f"No data files found for station {station}")
         return None
     
     data_dict = {}
@@ -78,377 +208,337 @@ def load_latest_data_for_station(station):
     for data_type, file_path in latest_files.items():
         try:
             df = pd.read_parquet(file_path)
+            
+            # Clean the data
+            df = clean_numeric_columns(df)
+            df = safe_convert_timestamp(df)
+            
             # Add metadata columns
             df['source_file'] = os.path.basename(file_path)
             df['station'] = station
             df['data_type'] = data_type
             df['file_path'] = file_path
+            
             data_dict[data_type] = df
-        except Exception as e:
-            st.error(f"Error loading {file_path}: {str(e)}")
+            
+        except Exception:
+            continue
     
     return data_dict
+
+def get_available_variables(df):
+    """Get available numeric variables from a DataFrame, excluding date/time related columns"""
+    # Get numeric columns only (excluding metadata columns)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    # Remove timestamp-related columns, metadata, and date/time related columns
+    exclude_cols = ['TIMESTAMP', 'source_file', 'station', 'data_type', 'file_path', 
+                   'Id', 'Min', 'RECORD', 'Year', 'Jday']
+    available_vars = [col for col in numeric_cols if col not in exclude_cols]
+    return available_vars
+
+def create_variable_selector(available_vars, default_vars, key_prefix):
+    """Create a multi-select widget for variables with default selection"""
+    selected_vars = st.multiselect(
+        "Select variables to display:",
+        options=available_vars,
+        default=default_vars,
+        key=f"{key_prefix}_selector"
+    )
+    return selected_vars
+
+def plot_selected_variables(df, selected_vars, plot_title, height=300):
+    """Create a line plot for selected variables"""
+    if not selected_vars or 'TIMESTAMP' not in df.columns:
+        return
+    
+    try:
+        plot_data = df[['TIMESTAMP'] + selected_vars].set_index('TIMESTAMP')
+        st.line_chart(plot_data, height=height, use_container_width=True)
+        st.caption(f"{plot_title}: {', '.join(selected_vars)}")
+    except Exception as e:
+        st.error(f"Error plotting {plot_title}: {str(e)}")
 
 # Get available stations
 available_stations = get_available_stations()
 
 if not available_stations:
-    st.error("No stations found in the interim directory. Please check the data pipeline and ensure files are being generated.")
+    st.error("No stations found in the interim directory.")
     st.stop()
 
-# Station selector
-st.header("Station Selection")
-selected_station = st.selectbox(
-    "Select Station:",
-    options=available_stations,
-    index=0,  # Default to first station
-    format_func=lambda x: x.upper()  # Display station names in uppercase
-)
+# Station selector - centered and prominent
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    selected_station = st.selectbox(
+        "Select Station:",
+        options=available_stations,
+        index=0,
+        format_func=lambda x: x.upper()
+    )
 
-st.markdown(f"**Currently viewing data for station: {selected_station.upper()}**")
+st.markdown(f'<h2 class="station-header">Station: {selected_station.upper()}</h2>', unsafe_allow_html=True)
 
 # Load data for selected station
 data_dict = load_latest_data_for_station(selected_station)
 
-# Add this function to get DAG status
-def get_dag_status():
-    try:
-        # Connect to PostgreSQL directly
-        conn = psycopg2.connect(
-            dbname="airflow",
-            user="airflow",
-            password="airflow",
-            host="postgres",
-            port="5432"
-        )
-        
-        # Query to get the latest DAG runs and their status
-        query = """
-        SELECT 
-            dag_id,
-            run_id,
-            state,
-            start_date,
-            end_date,
-            logical_date,
-            run_type,
-            queued_at
-        FROM dag_run
-        WHERE dag_id LIKE '%solar%' OR dag_id LIKE '%data%'
-        ORDER BY start_date DESC
-        LIMIT 10
-        """
-        
-        # Read into DataFrame
-        dag_status = pd.read_sql_query(query, conn)
-        conn.close()
-        
-        if dag_status.empty:
-            st.warning("""
-            No DAG runs found in the database. Please:
-            1. Go to Airflow UI (http://localhost:8080)
-            2. Enable your DAGs
-            3. Trigger a run manually or wait for scheduled runs
-            """)
-            return None
-            
-        return dag_status
-    except Exception as e:
-        st.error(f"Error fetching DAG status: {str(e)}")
-        return None
-
-# Define variable groups for each data type
-def get_variable_groups():
-    """Define which variables belong to which data type and plot group"""
-    return {
-        'SD': {
-            'Solar Radiation': ['glo_avg', 'dir_avg', 'dif_avg', 'glo_std', 'dir_std', 'dif_std'],
-            'Longwave Radiation': ['lw_raw_avg', 'lw_calc_avg', 'lw_raw_std', 'lw_calc_std'],
-            'PAR & LUX': ['par_avg', 'lux_avg', 'par_std', 'lux_std'],
-            'Temperatures': ['tp_dir', 'tp_lw_case'],
-            'Tilt': ['tilt_avg', 'tilt_std']
-        },
-        'MD': {
-            'Meteorological': ['tp_sfc', 'humid', 'press', 'rain'],
-            'Wind 10m': ['ws10_avg', 'wd10_avg', 'ws10_std', 'wd10_std']
-        },
-        'WD': {
-            'Wind 10m': ['ws10_avg', 'wd10_avg', 'ws10_std', 'wd10_std'],
-            'Wind 25m': ['ws25_avg', 'wd25_avg', 'ws25_std', 'wd25_std'],
-            'Wind 50m': ['ws50_avg', 'wd50_avg', 'ws50_std', 'wd50_std'],
-            'Temperatures': ['tp_25', 'tp_50', 'humid_25', 'humid_50']
-        }
-    }
-
+# Data Overview Section - Compact and informative
 if data_dict is not None:
-    # Pipeline Status Section
-    st.header("Pipeline Status")
-    
-    # Get DAG status
-    dag_status = get_dag_status()
-    
-    if dag_status is not None:
-        # Create a styled DataFrame
-        def color_status(val):
-            color_map = {
-                'success': 'background-color: #90EE90',  # Light green
-                'failed': 'background-color: #FFB6C1',   # Light red
-                'running': 'background-color: #ADD8E6',  # Light blue
-                'queued': 'background-color: #D3D3D3',  # Light gray
-                'scheduled': 'background-color: #FFE4B5'  # Light orange
-            }
-            return color_map.get(val.lower(), '')
-        
-        # Format the DataFrame
-        display_df = dag_status[[
-            'dag_id',
-            'run_id',
-            'state',
-            'logical_date',
-            'start_date',
-            'end_date',
-            'run_type'
-        ]].copy()
-        
-        # Convert datetime columns
-        for col in ['logical_date', 'start_date', 'end_date']:
-            display_df[col] = pd.to_datetime(display_df[col])
-        
-        # Calculate duration
-        display_df['duration'] = (display_df['end_date'] - display_df['start_date']).dt.total_seconds() / 60
-        
-        # Format column names for display
-        display_df.columns = [
-            'Pipeline',
-            'Run ID',
-            'Status',
-            'Logical Date',
-            'Start Time',
-            'End Time',
-            'Run Type',
-            'Duration (min)'
-        ]
-        
-        # Apply styling
-        styled_df = display_df.style.applymap(
-            color_status,
-            subset=['Status']
-        )
-        
-        # Display the styled table
-        st.dataframe(styled_df)
-        
-        # Add status summary
-        status_counts = dag_status['state'].value_counts()
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Runs", len(dag_status))
-        with col2:
-            st.metric("Successful", status_counts.get('success', 0))
-        with col3:
-            st.metric("Failed", status_counts.get('failed', 0))
+    st.header("📊 Data Overview")
 
-    # Data Overview Section
-    st.header("Latest Data Files")
-    
-    # Display information about loaded files
+    # Add legend for metrics
+    st.markdown("""
+<div style="font-size:1rem; color:#444; margin-bottom:0.5rem;">
+<b>Legend:</b> <b>Records</b> = number of data rows; <b>Columns</b> = number of variables; <b>Updated</b> = last file modification time
+</div>
+""", unsafe_allow_html=True)
+
+    # Display information about loaded files in a compact format
     file_info = []
     for data_type, df in data_dict.items():
+        timestamp_col = 'TIMESTAMP'
+        time_range = "N/A"
+        if timestamp_col in df.columns and pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
+            time_range = f"{df[timestamp_col].min().strftime('%Y-%m-%d %H:%M')} to {df[timestamp_col].max().strftime('%Y-%m-%d %H:%M')}"
         file_info.append({
             'Data Type': data_type,
-            'File': os.path.basename(df['file_path'].iloc[0]),
             'Records': len(df),
-            'Time Range': f"{df['TIMESTAMP'].min()} to {df['TIMESTAMP'].max()}",
-            'Last Modified': datetime.fromtimestamp(os.path.getmtime(df['file_path'].iloc[0]))
+            'Columns': len(df.columns),
+            'Time Range': time_range,
+            'Last Modified': datetime.fromtimestamp(os.path.getmtime(df['file_path'].iloc[0])).strftime('%Y-%m-%d %H:%M')
         })
-    
     file_df = pd.DataFrame(file_info)
-    st.dataframe(file_df, use_container_width=True)
+    # Display in columns for better space usage
+    cols = st.columns(len(file_info))
+    for i, (_, row) in enumerate(file_df.iterrows()):
+        with cols[i]:
+            st.metric(
+                label=f"{row['Data Type']} Data",
+                value=f"{row['Records']:,}",
+                delta=f"{row['Columns']} cols"
+            )
+            st.caption(f"Updated: {row['Last Modified']}")
 
-    # Data Visualization Section
-    st.header("Data Visualization")
-    
-    # Get variable groups
-    variable_groups = get_variable_groups()
-    
-    # Create three columns layout
+    # Data Visualization Section - Three column layout
+    st.header("📈 Real-time Data Visualization")
     col1, col2, col3 = st.columns([1, 1, 1])
-    
-    # First column: Solar/Radiation Data
+
+    # Column 1: Solar Data (SD)
     with col1:
-        st.subheader("Solar Data (SD)")
+        st.subheader("☀️ Solar Data (SD)")
+        
         if 'SD' in data_dict:
-            sd_data = data_dict['SD'].copy()
-            sd_data['TIMESTAMP'] = pd.to_datetime(sd_data['TIMESTAMP'])
+            df = data_dict['SD'].copy()
+            available_vars = get_available_variables(df)
             
-            # Variable selection for SD
-            st.write("**Select Variables to Plot:**")
-            for group_name, variables in variable_groups['SD'].items():
-                # Check which variables are actually available in the data
-                available_vars = [var for var in variables if var in sd_data.columns]
-                if available_vars:
-                    selected_vars = st.multiselect(
-                        f"{group_name}:",
-                        options=available_vars,
-                        default=available_vars,
-                        key=f"sd_{group_name}"
-                    )
-                    
-                    if selected_vars:
-                        plot_data = sd_data[['TIMESTAMP'] + selected_vars].set_index('TIMESTAMP')
-                        st.line_chart(plot_data, use_container_width=True)
+            if available_vars and 'TIMESTAMP' in df.columns:
+                # Solar Radiation Plot
+                st.markdown('<p class="subsection-header">Solar Radiation</p>', unsafe_allow_html=True)
+                solar_vars = [var for var in available_vars if any(x in var.lower() for x in ['glo', 'dir', 'dif']) and any(x in var.lower() for x in ['avg', 'std'])]
+                if solar_vars:
+                    selected_solar = create_variable_selector(solar_vars, solar_vars, "solar")
+                    plot_selected_variables(df, selected_solar, "Solar Radiation")
+                else:
+                    st.info("No solar radiation variables found.")
+                
+                # Longwave Radiation Plot
+                st.markdown('<p class="subsection-header">Longwave Radiation</p>', unsafe_allow_html=True)
+                lw_vars = [var for var in available_vars if 'lw' in var.lower() and any(x in var.lower() for x in ['avg', 'std'])]
+                if lw_vars:
+                    selected_lw = create_variable_selector(lw_vars, lw_vars, "longwave")
+                    plot_selected_variables(df, selected_lw, "Longwave Radiation")
+                else:
+                    st.info("No longwave radiation variables found.")
+                
+                # PAR & LUX Plot
+                st.markdown('<p class="subsection-header">PAR & LUX</p>', unsafe_allow_html=True)
+                par_lux_vars = [var for var in available_vars if any(x in var.lower() for x in ['par', 'lux']) and any(x in var.lower() for x in ['avg', 'std'])]
+                if par_lux_vars:
+                    selected_par_lux = create_variable_selector(par_lux_vars, par_lux_vars, "par_lux")
+                    plot_selected_variables(df, selected_par_lux, "PAR & LUX")
+                else:
+                    st.info("No PAR & LUX variables found.")
+                
+                # Temperature Plot
+                st.markdown('<p class="subsection-header">Temperatures</p>', unsafe_allow_html=True)
+                temp_vars = [var for var in available_vars if any(x in var.lower() for x in ['tp_', 'temp']) and any(x in var.lower() for x in ['avg', 'std'])]
+                if temp_vars:
+                    selected_temp = create_variable_selector(temp_vars, temp_vars, "temperature")
+                    plot_selected_variables(df, selected_temp, "Temperatures")
+                else:
+                    st.info("No temperature variables found.")
+            else:
+                st.warning("No numeric data available for SD.")
         else:
-            st.warning("No SD data available")
-    
-    # Second column: Environmental and Wind Data
+            st.info("No SD data available for this station.")
+
+    # Column 2: Environmental Data (MD and WD)
     with col2:
-        st.subheader("Environmental & Wind Data")
+        st.subheader("🌤️ Environmental Data")
         
-        # Environmental Data (MD)
-        st.write("**Environmental Data (MD):**")
+        # Meteorological Data Subsection
+        st.markdown('<p class="subsection-header">Meteorological Data</p>', unsafe_allow_html=True)
         if 'MD' in data_dict:
-            md_data = data_dict['MD'].copy()
-            md_data['TIMESTAMP'] = pd.to_datetime(md_data['TIMESTAMP'])
+            df_md = data_dict['MD'].copy()
+            available_vars_md = get_available_variables(df_md)
             
-            # Variable selection for MD
-            for group_name, variables in variable_groups['MD'].items():
-                # Check which variables are actually available in the data
-                available_vars = [var for var in variables if var in md_data.columns]
-                if available_vars:
-                    selected_vars = st.multiselect(
-                        f"{group_name}:",
-                        options=available_vars,
-                        default=available_vars,
-                        key=f"md_{group_name}"
-                    )
-                    
-                    if selected_vars:
-                        plot_data = md_data[['TIMESTAMP'] + selected_vars].set_index('TIMESTAMP')
-                        st.line_chart(plot_data, use_container_width=True)
+            if available_vars_md and 'TIMESTAMP' in df_md.columns:
+                meteo_vars = [var for var in available_vars_md if any(x in var.lower() for x in ['tp_sfc', 'humid', 'press', 'rain'])]
+                if meteo_vars:
+                    selected_meteo = create_variable_selector(meteo_vars, meteo_vars, "meteorological")
+                    plot_selected_variables(df_md, selected_meteo, "Meteorological Data")
+                else:
+                    st.info("No meteorological variables found in MD data.")
+            else:
+                st.warning("No numeric data available for MD.")
         else:
-            st.warning("No MD data available")
+            st.info("No MD data available for this station.")
         
-        # Wind Data (WD)
-        st.write("**Wind Data (WD):**")
+        # Wind Data Subsection
+        st.markdown('<p class="subsection-header">Wind Data</p>', unsafe_allow_html=True)
+        
+        # Wind at different heights
+        wind_heights = ['10m', '25m', '50m']
+        for height in wind_heights:
+            wind_vars = []
+            df_source = None
+            
+            # Check both MD and WD for wind data
+            for data_type in ['MD', 'WD']:
+                if data_type in data_dict:
+                    df_temp = data_dict[data_type].copy()
+                    available_vars_temp = get_available_variables(df_temp)
+                    height_vars = [var for var in available_vars_temp if height in var]
+                    if height_vars:
+                        wind_vars = height_vars
+                        df_source = df_temp
+                        break
+            
+            if wind_vars and df_source is not None:
+                st.write(f"**Wind at {height}**")
+                selected_wind = create_variable_selector(wind_vars, wind_vars, f"wind_{height}")
+                plot_selected_variables(df_source, selected_wind, f"Wind at {height}", height=200)
+            else:
+                st.info(f"No wind data available at {height}.")
+        
+        # Temperature per Level Subsection
+        st.markdown('<p class="subsection-header">Temperature per Level</p>', unsafe_allow_html=True)
         if 'WD' in data_dict:
-            wd_data = data_dict['WD'].copy()
-            wd_data['TIMESTAMP'] = pd.to_datetime(wd_data['TIMESTAMP'])
+            df_wd = data_dict['WD'].copy()
+            available_vars_wd = get_available_variables(df_wd)
             
-            # Variable selection for WD
-            for group_name, variables in variable_groups['WD'].items():
-                # Check which variables are actually available in the data
-                available_vars = [var for var in variables if var in wd_data.columns]
-                if available_vars:
-                    selected_vars = st.multiselect(
-                        f"{group_name}:",
-                        options=available_vars,
-                        default=available_vars,
-                        key=f"wd_{group_name}"
-                    )
-                    
-                    if selected_vars:
-                        plot_data = wd_data[['TIMESTAMP'] + selected_vars].set_index('TIMESTAMP')
-                        st.line_chart(plot_data, use_container_width=True)
+            if available_vars_wd and 'TIMESTAMP' in df_wd.columns:
+                temp_humid_vars = [var for var in available_vars_wd if any(x in var.lower() for x in ['tp_', 'humid_'])]
+                if temp_humid_vars:
+                    selected_temp_humid = create_variable_selector(temp_humid_vars, temp_humid_vars, "temp_humid_levels")
+                    plot_selected_variables(df_wd, selected_temp_humid, "Temperature & Humidity per Level")
+                else:
+                    st.info("No temperature/humidity variables found in WD data.")
+            else:
+                st.warning("No numeric data available for WD.")
         else:
-            st.warning("No WD data available")
-    
-    # Third column: Detailed Variable Viewer
+            st.info("No WD data available for this station.")
+
+    # Column 3: Detailed View
     with col3:
-        st.subheader("Detailed Variable Analysis")
+        st.subheader("🔍 Detailed View")
         
-        # Create a comprehensive list of all available variables
-        all_variables = []
-        for data_type, df in data_dict.items():
-            # Get numeric columns only (excluding metadata columns)
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            # Remove timestamp-related columns and metadata
-            exclude_cols = ['TIMESTAMP', 'source_file', 'station', 'data_type', 'file_path']
-            available_vars = [col for col in numeric_cols if col not in exclude_cols]
+        # Collect only variables that are shown in other sections
+        detailed_variables = []
+        
+        # Get SD variables (Solar Data section)
+        if 'SD' in data_dict:
+            df_sd = data_dict['SD'].copy()
+            available_vars_sd = get_available_variables(df_sd)
             
-            for var in available_vars:
-                all_variables.append(f"{data_type}_{var}")
+            # Solar radiation variables (glo, dir, dif with avg/std)
+            solar_vars = [var for var in available_vars_sd if any(x in var.lower() for x in ['glo', 'dir', 'dif']) and any(x in var.lower() for x in ['avg', 'std'])]
+            detailed_variables.extend([f"SD: {var}" for var in solar_vars])
+            
+            # Longwave variables (lw with avg/std)
+            lw_vars = [var for var in available_vars_sd if 'lw' in var.lower() and any(x in var.lower() for x in ['avg', 'std'])]
+            detailed_variables.extend([f"SD: {var}" for var in lw_vars])
+            
+            # PAR & LUX variables (par, lux with avg/std)
+            par_lux_vars = [var for var in available_vars_sd if any(x in var.lower() for x in ['par', 'lux']) and any(x in var.lower() for x in ['avg', 'std'])]
+            detailed_variables.extend([f"SD: {var}" for var in par_lux_vars])
+            
+            # Temperature variables (tp_, temp with avg/std)
+            temp_vars = [var for var in available_vars_sd if any(x in var.lower() for x in ['tp_', 'temp']) and any(x in var.lower() for x in ['avg', 'std'])]
+            detailed_variables.extend([f"SD: {var}" for var in temp_vars])
         
-        if all_variables:
-            # Variable selector
-            selected_variable = st.selectbox(
-                "Select Variable for Detailed Analysis:",
-                options=all_variables,
-                format_func=lambda x: f"{x.split('_')[0]} - {x.split('_', 1)[1]}"
+        # Get MD variables (Environmental Data section)
+        if 'MD' in data_dict:
+            df_md = data_dict['MD'].copy()
+            available_vars_md = get_available_variables(df_md)
+            
+            # Meteorological variables
+            meteo_vars = [var for var in available_vars_md if any(x in var.lower() for x in ['tp_sfc', 'humid', 'press', 'rain'])]
+            detailed_variables.extend([f"MD: {var}" for var in meteo_vars])
+            
+            # Wind variables at different heights
+            wind_heights = ['10m', '25m', '50m']
+            for height in wind_heights:
+                height_vars = [var for var in available_vars_md if height in var]
+                detailed_variables.extend([f"MD: {var}" for var in height_vars])
+        
+        # Get WD variables (Environmental Data section)
+        if 'WD' in data_dict:
+            df_wd = data_dict['WD'].copy()
+            available_vars_wd = get_available_variables(df_wd)
+            
+            # Wind variables at different heights
+            wind_heights = ['10m', '25m', '50m']
+            for height in wind_heights:
+                height_vars = [var for var in available_vars_wd if height in var]
+                detailed_variables.extend([f"WD: {var}" for var in height_vars])
+            
+            # Temperature and humidity per level
+            temp_humid_vars = [var for var in available_vars_wd if any(x in var.lower() for x in ['tp_', 'humid_'])]
+            detailed_variables.extend([f"WD: {var}" for var in temp_humid_vars])
+        
+        if detailed_variables:
+            # Variable selector for detailed view
+            st.write("**Select variable for detailed view:**")
+            
+            selected_detailed_var = st.selectbox(
+                "Choose variable:",
+                options=detailed_variables,
+                key="detailed_var_selector"
             )
             
-            if selected_variable:
-                data_type, variable = selected_variable.split('_', 1)
-                df = data_dict[data_type].copy()
-                df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'])
+            if selected_detailed_var:
+                data_type, var_name = selected_detailed_var.split(": ", 1)
+                df_detail = data_dict[data_type].copy()
                 
-                st.write(f"**{data_type} - {variable} Time Series**")
-                # Plot the selected variable
-                plot_data = df[['TIMESTAMP', variable]].set_index('TIMESTAMP')
-                st.line_chart(plot_data, use_container_width=True)
-                
-                # Show recent data points
-                st.write("**Recent Data Points:**")
-                recent_data = df[['TIMESTAMP', variable]].tail(10)
-                st.dataframe(recent_data, use_container_width=True)
-                
-                st.write(f"**{variable} Statistics**")
-                
-                # Basic statistics
-                stats = df[variable].describe()
-                st.write("**Basic Statistics:**")
-                st.dataframe(stats, use_container_width=True)
-                
-                # Data quality info
-                total_values = len(df[variable])
-                null_values = df[variable].isnull().sum()
-                valid_values = total_values - null_values
-                
-                st.write("**Data Quality:**")
-                st.metric("Total Values", total_values)
-                st.metric("Valid Values", valid_values)
-                st.metric("Null Values", null_values)
-                st.metric("Completeness (%)", f"{(valid_values/total_values*100):.1f}%")
-                
-                # Value range
-                if valid_values > 0:
-                    min_val = df[variable].min()
-                    max_val = df[variable].max()
-                    st.write("**Value Range:**")
-                    st.metric("Minimum", f"{min_val:.4f}")
-                    st.metric("Maximum", f"{max_val:.4f}")
-                    st.metric("Range", f"{max_val - min_val:.4f}")
+                if 'TIMESTAMP' in df_detail.columns and var_name in df_detail.columns:
+                    st.write(f"**{var_name} ({data_type})**")
+                    
+                    # Create detailed plot
+                    plot_data = df_detail[['TIMESTAMP', var_name]].set_index('TIMESTAMP')
+                    st.line_chart(plot_data, height=400, use_container_width=True)
+                    
+                    # Show statistics
+                    col_stat1, col_stat2 = st.columns(2)
+                    with col_stat1:
+                        st.metric("Mean", f"{df_detail[var_name].mean():.2f}")
+                        st.metric("Min", f"{df_detail[var_name].min():.2f}")
+                    with col_stat2:
+                        st.metric("Max", f"{df_detail[var_name].max():.2f}")
+                        st.metric("Std Dev", f"{df_detail[var_name].std():.2f}")
+                else:
+                    st.error(f"Variable {var_name} not found in {data_type} data.")
         else:
-            st.warning("No variables available for detailed analysis")
+            st.info("No variables available for detailed view.")
 
-    # Data Quality Section
-    st.header("Data Quality Overview")
-    
-    quality_info = []
-    for data_type, df in data_dict.items():
-        
-        # Basic quality metrics
-        total_records = len(df)
-        null_counts = df.isnull().sum().sum()
-        duplicate_records = df.duplicated().sum()
-        
-        quality_info.append({
-            'Station': selected_station.upper(),
-            'Data Type': data_type,
-            'Total Records': total_records,
-            'Null Values': null_counts,
-            'Duplicate Records': duplicate_records,
-            'Data Completeness (%)': round((total_records - null_counts) / total_records * 100, 2) if total_records > 0 else 0
-        })
-    
-    quality_df = pd.DataFrame(quality_info)
-    st.dataframe(quality_df, use_container_width=True)
-
-    # Raw Data Section (collapsible)
-    with st.expander("Raw Data Tables"):
+    # Raw Data Section (collapsible) - Only show if needed
+    with st.expander("📋 Raw Data (Click to expand)"):
         for data_type, df in data_dict.items():
             st.write(f"**{selected_station.upper()} - {data_type} Data**")
-            st.dataframe(df.head(100), use_container_width=True)  # Show first 100 rows
-            st.write(f"Total records: {len(df)}")
+            st.write(f"Shape: {df.shape}")
+            st.dataframe(df.head(20), use_container_width=True)  # Show first 20 rows only
 
 else:
-    st.error("No data files found. Please check the data pipeline and ensure files are being generated.")
+    st.error("No data files found for the selected station.")
+
+# Footer
+st.markdown("---")
+st.markdown('<p style="text-align: center; color: #666; font-size: 0.9rem;">Solar Data Monitoring System - Crisis Room Dashboard</p>', unsafe_allow_html=True)

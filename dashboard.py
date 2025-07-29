@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import glob
 import re
 import numpy as np
+import pvlib
+from pvlib.location import Location
 
 # Set page config for crisis room use
 st.set_page_config(
@@ -72,6 +74,42 @@ st.markdown("""
 st.markdown('<h1 class="main-header">Solar Data Monitor</h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Real-time Solar Radiation & Meteorological Data</p>', unsafe_allow_html=True)
 
+
+def calculate_clearsky_ineichen(df, latitude, longitude, altitude=0, tz='UTC'):
+    """
+    Adiciona ao DataFrame estimativas de irradiância de céu limpo (GHI, DNI, DHI)
+    usando o modelo Ineichen da biblioteca pvlib.
+    """
+    
+    df = df.copy()
+    
+    # Garante datetime com timezone
+    df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
+    df = df.dropna(subset=['TIMESTAMP'])
+
+    # Localiza ou converte o timezone
+    if df['TIMESTAMP'].dt.tz is None:
+        df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_localize(tz)
+    else:
+        df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_convert(tz)
+
+    # Usa DatetimeIndex
+    df = df.set_index('TIMESTAMP')
+
+    # Cria o objeto Location
+    location = pvlib.location.Location(latitude, longitude, tz=tz, altitude=altitude)
+
+    # Calcula céu limpo com DatetimeIndex
+    clearsky = location.get_clearsky(df.index)
+
+    # Adiciona ao DataFrame
+    df['clearsky_GHI'] = clearsky['ghi']
+    df['clearsky_DNI'] = clearsky['dni']
+    df['clearsky_DHI'] = clearsky['dhi']
+
+    return df.reset_index()
+
+
 # Function to get available stations
 @st.cache_data
 def get_available_stations():
@@ -81,9 +119,32 @@ def get_available_stations():
     if not os.path.exists(interim_dir):
         return []
     
-    # Look for station subdirectories
-    station_dirs = [d for d in os.listdir(interim_dir) if os.path.isdir(os.path.join(interim_dir, d))]
+    # Normaliza os nomes das pastas das estações
+    station_dirs = [d.strip().lower() for d in os.listdir(interim_dir) if os.path.isdir(os.path.join(interim_dir, d))]
     return sorted(station_dirs)
+
+
+# Function to get available metadata
+@st.cache_data
+def get_station_metadata(station_dirs):
+    """Get metadata of available stations (latitude and longitude), filtered by actual station folders"""
+    interim_dir = os.path.expanduser("data/interim")
+    location_csv = os.path.join(interim_dir, 'INPESONDA_Stations.csv')
+
+    if not os.path.exists(interim_dir) or not os.path.exists(location_csv):
+        st.warning("Arquivo de localização 'INPESONDA_Stations.csv' não encontrado.")
+        return pd.DataFrame(columns=['station', 'latitude', 'longitude'])
+
+    # Lê e normaliza os nomes das estações do CSV
+    df_locations = pd.read_csv(location_csv)
+    df_locations['station_normalized'] = df_locations['station'].astype(str).str.strip().str.lower()
+
+    # Filtra as estações presentes nas pastas
+    df_filtered = df_locations[df_locations['station_normalized'].isin(station_dirs)].copy()
+    df_filtered = df_filtered.drop_duplicates(subset='station_normalized')
+
+    return df_filtered.sort_values('station').reset_index(drop=True)
+
 
 # Function to get the latest file for a specific station and data type
 @st.cache_data
@@ -208,6 +269,7 @@ def load_latest_data_for_station(station):
     for data_type, file_path in latest_files.items():
         try:
             df = pd.read_parquet(file_path)
+            print("Colunas disponíveis no arquivo:", df.columns.tolist())
             
             # Clean the data
             df = clean_numeric_columns(df)
@@ -258,13 +320,19 @@ def plot_selected_variables(df, selected_vars, plot_title, height=300):
     except Exception as e:
         st.error(f"Error plotting {plot_title}: {str(e)}")
 
-# Get available stations
+
+# Primeiro, obtém a lista de pastas das estações disponíveis
 available_stations = get_available_stations()
 
-if not available_stations:
-    st.error("No stations found in the interim directory.")
-    st.stop()
+# Depois, passa essa lista como argumento para a função de metadata
+station_metadata = get_station_metadata(available_stations)      
 
+if not available_stations:
+    print("No stations found in the directory 'data/interim'.")
+else:
+    print("Available stations:", available_stations)
+
+    
 # Station selector - centered and prominent
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
@@ -327,14 +395,33 @@ if data_dict is not None:
         
         if 'SD' in data_dict:
             df = data_dict['SD'].copy()
+            
+            # Get station metadata for clear sky calculation
+            filtered_row = station_metadata[
+                           station_metadata['station'].str.lower() == selected_station.lower()]
+
+            if not filtered_row.empty:
+                latitude = filtered_row['latitude'].values[0]
+                longitude = filtered_row['longitude'].values[0]
+                
+                # Apply clear sky model to add clear sky variables
+                df = calculate_clearsky_ineichen(df, latitude, longitude, tz='America/Sao_Paulo')
+            
             available_vars = get_available_variables(df)
             
             if available_vars and 'TIMESTAMP' in df.columns:
-                # Solar Radiation Plot
+                # Solar Radiation Plot (including clear sky data)
                 st.markdown('<p class="subsection-header">Solar Radiation</p>', unsafe_allow_html=True)
                 solar_vars = [var for var in available_vars if any(x in var.lower() for x in ['glo', 'dir', 'dif']) and any(x in var.lower() for x in ['avg', 'std'])]
-                if solar_vars:
-                    selected_solar = create_variable_selector(solar_vars, solar_vars, "solar")
+                
+                # Add clear sky variables if they exist
+                clearsky_vars = ['clearsky_GHI', 'clearsky_DNI', 'clearsky_DHI']
+                available_clearsky_vars = [var for var in clearsky_vars if var in df.columns]
+                
+                if solar_vars or available_clearsky_vars:
+                    # Combine solar and clear sky variables
+                    all_solar_vars = solar_vars + available_clearsky_vars
+                    selected_solar = create_variable_selector(all_solar_vars, all_solar_vars, "solar")
                     plot_selected_variables(df, selected_solar, "Solar Radiation")
                 else:
                     st.info("No solar radiation variables found.")
@@ -447,11 +534,31 @@ if data_dict is not None:
         # Get SD variables (Solar Data section)
         if 'SD' in data_dict:
             df_sd = data_dict['SD'].copy()
+            
+            # Get station metadata for clear sky calculation
+            filtered_row = station_metadata[
+                           station_metadata['station'].str.lower() == selected_station.lower()]
+
+            if not filtered_row.empty:
+                latitude = filtered_row['latitude'].values[0]
+                longitude = filtered_row['longitude'].values[0]
+                
+                # Apply clear sky model to add clear sky variables
+                df_sd = calculate_clearsky_ineichen(df_sd, latitude, longitude, tz='America/Sao_Paulo')
+            else:
+                st.warning(f"A estação '{selected_station.lower()}' não foi encontrada no metadata.")
+                st.stop()
+            
             available_vars_sd = get_available_variables(df_sd)
             
             # Solar radiation variables (glo, dir, dif with avg/std)
             solar_vars = [var for var in available_vars_sd if any(x in var.lower() for x in ['glo', 'dir', 'dif']) and any(x in var.lower() for x in ['avg', 'std'])]
             detailed_variables.extend([f"SD: {var}" for var in solar_vars])
+            
+            # Clear sky variables
+            clearsky_vars = ['clearsky_GHI', 'clearsky_DNI', 'clearsky_DHI']
+            available_clearsky_vars = [var for var in clearsky_vars if var in df_sd.columns]
+            detailed_variables.extend([f"SD: {var}" for var in available_clearsky_vars])
             
             # Longwave variables (lw with avg/std)
             lw_vars = [var for var in available_vars_sd if 'lw' in var.lower() and any(x in var.lower() for x in ['avg', 'std'])]

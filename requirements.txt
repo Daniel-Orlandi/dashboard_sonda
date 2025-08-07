@@ -4,3 +4,4 @@ sqlalchemy
 streamlit
 python-dotenv
 pvlib
+timezonefinder==5.2.0

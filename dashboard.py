@@ -8,6 +8,8 @@ import re
 import numpy as np
 import pvlib
 from pvlib.location import Location
+from timezonefinder import TimezoneFinder
+import pytz
 
 # Set page config for crisis room use
 st.set_page_config(
@@ -75,21 +77,44 @@ st.markdown('<h1 class="main-header">Solar Data Monitor</h1>', unsafe_allow_html
 st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Real-time Solar Radiation & Meteorological Data</p>', unsafe_allow_html=True)
 
 
-def calculate_clearsky_ineichen(df, latitude, longitude, altitude=0, tz='UTC'):
+def calculate_clearsky_ineichen(df, latitude, longitude, altitude=0, tz=None):
     """
     Adiciona ao DataFrame estimativas de irradiância de céu limpo (GHI, DNI, DHI)
     usando o modelo Ineichen da biblioteca pvlib.
+
+    Se o timezone (tz) não for especificado, ele será detectado automaticamente com base na latitude e longitude.
     """
     
     df = df.copy()
+    
+    # Find the timestamp column
+    timestamp_col = 'TIMESTAMP'
+    if 'TIMESTAMP' not in df.columns:
+        # Look for common timestamp column names
+        possible_timestamp_cols = ['TIMESTAMP', 'timestamp', 'Timestamp', 'time', 'Time', 'TIME', 'date', 'Date', 'DATE', 'datetime', 'Datetime', 'DATETIME']
+        for col in possible_timestamp_cols:
+            if col in df.columns:
+                timestamp_col = col
+                # Rename to TIMESTAMP for consistency
+                df = df.rename(columns={col: 'TIMESTAMP'})
+                break
+        else:
+            raise ValueError(f"No timestamp column found. Available columns: {df.columns.tolist()}")
     
     # Garante datetime com timezone
     df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
     df = df.dropna(subset=['TIMESTAMP'])
 
+    # Detecta timezone automaticamente se não for fornecido
+    if tz is None:
+        tf = TimezoneFinder()
+        tz = tf.timezone_at(lat=latitude, lng=longitude)
+        if tz is None:
+            raise ValueError("Não foi possível determinar o timezone automaticamente. Forneça um valor para o parâmetro 'tz'.")
+
     # Localiza ou converte o timezone
     if df['TIMESTAMP'].dt.tz is None:
-        df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_localize(tz)
+        df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_localize('UTC').dt.tz_convert(tz)
     else:
         df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_convert(tz)
 
@@ -108,6 +133,42 @@ def calculate_clearsky_ineichen(df, latitude, longitude, altitude=0, tz='UTC'):
     df['clearsky_DHI'] = clearsky['dhi']
 
     return df.reset_index()
+
+
+
+# def calculate_clearsky_ineichen(df, latitude, longitude, altitude=0, tz='UTC'):
+#     """
+#     Adiciona ao DataFrame estimativas de irradiância de céu limpo (GHI, DNI, DHI)
+#     usando o modelo Ineichen da biblioteca pvlib.
+#     """
+    
+#     df = df.copy()
+    
+#     # Garante datetime com timezone
+#     df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
+#     df = df.dropna(subset=['TIMESTAMP'])
+
+#     # Localiza ou converte o timezone
+#     if df['TIMESTAMP'].dt.tz is None:
+#         df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_localize(tz)
+#     else:
+#         df['TIMESTAMP'] = df['TIMESTAMP'].dt.tz_convert(tz)
+
+#     # Usa DatetimeIndex
+#     df = df.set_index('TIMESTAMP')
+
+#     # Cria o objeto Location
+#     location = pvlib.location.Location(latitude, longitude, tz=tz, altitude=altitude)
+
+#     # Calcula céu limpo com DatetimeIndex
+#     clearsky = location.get_clearsky(df.index)
+
+#     # Adiciona ao DataFrame
+#     df['clearsky_GHI'] = clearsky['ghi']
+#     df['clearsky_DNI'] = clearsky['dni']
+#     df['clearsky_DHI'] = clearsky['dhi']
+
+#     return df.reset_index()
 
 
 # Function to get available stations
@@ -184,8 +245,21 @@ def safe_convert_timestamp(df, timestamp_col='TIMESTAMP'):
     """
     Safely convert timestamp column to datetime, handling various formats and issues
     """
+    # First, try to find a timestamp column if the specified one doesn't exist
     if timestamp_col not in df.columns:
-        return df
+        # Look for common timestamp column names
+        possible_timestamp_cols = ['TIMESTAMP', 'timestamp', 'Timestamp', 'time', 'Time', 'TIME', 'date', 'Date', 'DATE', 'datetime', 'Datetime', 'DATETIME']
+        for col in possible_timestamp_cols:
+            if col in df.columns:
+                timestamp_col = col
+                break
+        else:
+            # If no timestamp column found, create a synthetic one
+            print(f"Warning: No timestamp column found. Available columns: {df.columns.tolist()}")
+            start_time = datetime.now() - timedelta(minutes=len(df))
+            timestamps = [start_time + timedelta(minutes=i) for i in range(len(df))]
+            df['TIMESTAMP'] = timestamps
+            return df
     
     # Check if already datetime
     if pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
@@ -269,11 +343,13 @@ def load_latest_data_for_station(station):
     for data_type, file_path in latest_files.items():
         try:
             df = pd.read_parquet(file_path)
-            print("Colunas disponíveis no arquivo:", df.columns.tolist())
+            print(f"Colunas disponíveis no arquivo {data_type}:", df.columns.tolist())
+            print(f"Shape do arquivo {data_type}:", df.shape)
             
             # Clean the data
             df = clean_numeric_columns(df)
             df = safe_convert_timestamp(df)
+            print(f"Após processamento - colunas {data_type}:", df.columns.tolist())
             
             # Add metadata columns
             df['source_file'] = os.path.basename(file_path)

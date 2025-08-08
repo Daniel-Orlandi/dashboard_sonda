@@ -339,12 +339,18 @@ def load_latest_data_for_station(station):
         return None
     
     data_dict = {}
+    failed_files = []
     
     for data_type, file_path in latest_files.items():
         try:
             df = pd.read_parquet(file_path)
             print(f"Colunas disponíveis no arquivo {data_type}:", df.columns.tolist())
             print(f"Shape do arquivo {data_type}:", df.shape)
+            
+            if df.empty:
+                print(f"Warning: {data_type} file is empty")
+                failed_files.append(f"{data_type} (empty file)")
+                continue
             
             # Clean the data
             df = clean_numeric_columns(df)
@@ -359,10 +365,16 @@ def load_latest_data_for_station(station):
             
             data_dict[data_type] = df
             
-        except Exception:
+        except Exception as e:
+            print(f"Error loading {data_type} data: {str(e)}")
+            failed_files.append(f"{data_type} (error: {str(e)[:50]}...)")
             continue
     
-    return data_dict
+    # Display warnings for failed files in the UI
+    if failed_files:
+        st.warning(f"⚠️ Could not load some data files for station {station.upper()}: {', '.join(failed_files)}")
+    
+    return data_dict if data_dict else None
 
 def get_available_variables(df):
     """Get available numeric variables from a DataFrame, excluding date/time related columns"""
@@ -385,16 +397,49 @@ def create_variable_selector(available_vars, default_vars, key_prefix):
     return selected_vars
 
 def plot_selected_variables(df, selected_vars, plot_title, height=300):
-    """Create a line plot for selected variables"""
-    if not selected_vars or 'TIMESTAMP' not in df.columns:
-        return
+    """Create a line plot for selected variables with comprehensive error handling"""
+    if not selected_vars:
+        st.warning(f"⚠️ No variables selected for {plot_title}. Please select at least one variable from the dropdown above.")
+        return False
+    
+    if 'TIMESTAMP' not in df.columns:
+        st.error(f"❌ Timestamp data not available for {plot_title}. Cannot create time series plot.")
+        return False
+    
+    # Check if selected variables exist in dataframe
+    missing_vars = [var for var in selected_vars if var not in df.columns]
+    if missing_vars:
+        available_vars = [var for var in selected_vars if var in df.columns]
+        if missing_vars:
+            st.warning(f"⚠️ The following variables are not available in {plot_title}: {', '.join(missing_vars)}")
+        if not available_vars:
+            st.error(f"❌ None of the selected variables are available for {plot_title}.")
+            return False
+        selected_vars = available_vars
+        st.info(f"ℹ️ Plotting available variables for {plot_title}: {', '.join(selected_vars)}")
     
     try:
+        # Check if there's actual data to plot
         plot_data = df[['TIMESTAMP'] + selected_vars].set_index('TIMESTAMP')
-        st.line_chart(plot_data, height=height, use_container_width=True)
-        st.caption(f"{plot_title}: {', '.join(selected_vars)}")
+        
+        # Remove rows where all selected variables are NaN
+        plot_data_clean = plot_data.dropna(how='all')
+        
+        if plot_data_clean.empty:
+            st.warning(f"⚠️ No valid data available for {plot_title}. All values are missing or invalid.")
+            return False
+        
+        if len(plot_data_clean) < len(plot_data) * 0.1:  # Less than 10% valid data
+            st.warning(f"⚠️ Limited data available for {plot_title} ({len(plot_data_clean)} out of {len(plot_data)} records have valid data).")
+        
+        st.line_chart(plot_data_clean, height=height, use_container_width=True)
+        st.caption(f"📊 {plot_title}: {', '.join(selected_vars)} ({len(plot_data_clean)} data points)")
+        return True
+        
     except Exception as e:
-        st.error(f"Error plotting {plot_title}: {str(e)}")
+        st.error(f"❌ Error creating plot for {plot_title}: {str(e)}")
+        st.error("This might be due to data format issues or memory constraints.")
+        return False
 
 
 # Primeiro, obtém a lista de pastas das estações disponíveis
@@ -404,7 +449,9 @@ available_stations = get_available_stations()
 station_metadata = get_station_metadata(available_stations)      
 
 if not available_stations:
-    print("No stations found in the directory 'data/interim'.")
+    st.error("❌ No stations found in the directory 'data/interim'.")
+    st.info("📁 Please ensure that station data has been processed and is available in the interim directory.")
+    st.stop()
 else:
     print("Available stations:", available_stations)
 
@@ -425,7 +472,7 @@ st.markdown(f'<h2 class="station-header">Station: {selected_station.upper()}</h2
 data_dict = load_latest_data_for_station(selected_station)
 
 # Data Overview Section - Compact and informative
-if data_dict is not None:
+if data_dict is not None and len(data_dict) > 0:
     st.header("📊 Data Overview")
 
     # Add legend for metrics
@@ -477,11 +524,16 @@ if data_dict is not None:
                            station_metadata['station'].str.lower() == selected_station.lower()]
 
             if not filtered_row.empty:
-                latitude = filtered_row['latitude'].values[0]
-                longitude = filtered_row['longitude'].values[0]
-                
-                # Apply clear sky model to add clear sky variables
-                df = calculate_clearsky_ineichen(df, latitude, longitude, tz='America/Sao_Paulo')
+                try:
+                    latitude = filtered_row['latitude'].values[0]
+                    longitude = filtered_row['longitude'].values[0]
+                    
+                    # Apply clear sky model to add clear sky variables
+                    df = calculate_clearsky_ineichen(df, latitude, longitude, tz='America/Sao_Paulo')
+                except Exception as e:
+                    st.warning(f"⚠️ Could not calculate clear sky data for {selected_station.upper()}: {str(e)}")
+            else:
+                st.warning(f"⚠️ Station metadata not found for {selected_station.upper()}. Clear sky calculations will not be available.")
             
             available_vars = get_available_variables(df)
             
@@ -497,7 +549,12 @@ if data_dict is not None:
                 if solar_vars or available_clearsky_vars:
                     # Combine solar and clear sky variables
                     all_solar_vars = solar_vars + available_clearsky_vars
-                    selected_solar = create_variable_selector(all_solar_vars, all_solar_vars, "solar")
+                    
+                    # Set default to only GHI and clear sky GHI
+                    ghi_vars = [var for var in all_solar_vars if 'glo' in var.lower() or var == 'clearsky_GHI']
+                    default_solar_vars = ghi_vars if ghi_vars else all_solar_vars[:2]  # fallback to first 2 if no GHI found
+                    
+                    selected_solar = create_variable_selector(all_solar_vars, default_solar_vars, "solar")
                     plot_selected_variables(df, selected_solar, "Solar Radiation")
                 else:
                     st.info("No solar radiation variables found.")
@@ -616,14 +673,16 @@ if data_dict is not None:
                            station_metadata['station'].str.lower() == selected_station.lower()]
 
             if not filtered_row.empty:
-                latitude = filtered_row['latitude'].values[0]
-                longitude = filtered_row['longitude'].values[0]
-                
-                # Apply clear sky model to add clear sky variables
-                df_sd = calculate_clearsky_ineichen(df_sd, latitude, longitude, tz='America/Sao_Paulo')
+                try:
+                    latitude = filtered_row['latitude'].values[0]
+                    longitude = filtered_row['longitude'].values[0]
+                    
+                    # Apply clear sky model to add clear sky variables
+                    df_sd = calculate_clearsky_ineichen(df_sd, latitude, longitude, tz='America/Sao_Paulo')
+                except Exception as e:
+                    st.warning(f"⚠️ Could not calculate clear sky data for detailed view: {str(e)}")
             else:
-                st.warning(f"A estação '{selected_station.lower()}' não foi encontrada no metadata.")
-                st.stop()
+                st.warning(f"⚠️ Station metadata not found for {selected_station.upper()}. Clear sky data will not be available in detailed view.")
             
             available_vars_sd = get_available_variables(df_sd)
             
@@ -720,7 +779,15 @@ if data_dict is not None:
             st.dataframe(df.head(20), use_container_width=True)  # Show first 20 rows only
 
 else:
-    st.error("No data files found for the selected station.")
+    st.error(f"❌ No data files found for station '{selected_station.upper()}'")
+    st.info("📋 This could mean:")
+    st.markdown("""
+    - No processed data files exist for this station
+    - The data processing pipeline hasn't run for this station  
+    - The station folder exists but contains no valid parquet files
+    - There was an error during data processing
+    """)
+    st.info("💡 Please check the data processing logs or re-run the ETL pipeline for this station.")
 
 # Footer
 st.markdown("---")
